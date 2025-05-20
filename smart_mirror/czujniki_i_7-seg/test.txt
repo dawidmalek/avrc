@@ -1,0 +1,190 @@
+#include <avr/io.h>
+#define F_CPU 1000000UL
+#include <util/delay.h>
+#include <avr/interrupt.h>
+
+#define zero		PORTD = 0b00111111;
+#define jeden		PORTD = 0b00001100;
+#define dwa			PORTD = 0b01110110;
+#define trzy		PORTD = 0b01011110;
+#define cztery		PORTD = 0b01001101;
+#define piec		PORTD = 0b01011011;
+#define szesc		PORTD = 0b01111011;
+#define siedem		PORTD = 0b00001110;
+#define osiem		PORTD = 0b01111111;
+#define dziewiec	PORTD = 0b01011111;
+#define litera_r	PORTD = 0b01100000;
+#define litera_H	PORTD = 0b01101101;
+#define stopien		PORTD = 0b01000111;
+#define litera_C	PORTD = 0b00110011;
+#define litera_A	PORTD = 0b01101111;
+#define litera_b	PORTD = 0b01111001;
+	
+#define Seg1		PORTB = 0b00001110;
+#define Seg2		PORTB = 0b00001101;
+#define Seg3		PORTB = 0b00001011;
+#define Seg4		PORTB = 0b00000111;
+
+void wyswietlCyfre(uint8_t cyfra) {
+	switch (cyfra) {
+		case 0: zero; break;
+		case 1: jeden; break;
+		case 2: dwa; break;
+		case 3: trzy; break;
+		case 4: cztery; break;
+		case 5: piec; break;
+		case 6: szesc; break;
+		case 7: siedem; break;
+		case 8: osiem; break;
+		case 9: dziewiec; break;
+		case 10: litera_A; break;
+		case 11: litera_b; break;
+		case 12: litera_C; break;
+		case 13: litera_r; break;
+		case 14: litera_H; break;
+		case 15: stopien; break;
+	}
+}
+volatile uint8_t temperatura_dziesiatki_global = 8;
+volatile uint8_t temperatura_jednosci_global = 8;
+volatile uint8_t odczyt_gotowy = 0;
+volatile uint8_t dane_czujnika[6];
+
+uint8_t i2c_start(void) {
+	TWCR = (1<<TWEN) | (1<<TWSTA) | (1<<TWINT);
+	while (!(TWCR & (1<<TWINT)));
+	return (TWSR & 0xF8);
+}
+
+uint8_t i2c_write(uint8_t data) {
+	TWDR = data;
+	TWCR = (1<<TWEN) | (1<<TWINT);
+	while (!(TWCR & (1<<TWINT)));
+	return (TWSR & 0xF8);
+}
+
+uint8_t i2c_read_ack(void) {
+	TWCR = (1<<TWEN) | (1<<TWINT) | (1<<TWEA);
+	while (!(TWCR & (1<<TWINT)));
+	return TWDR;
+}
+
+uint8_t i2c_read_nack(void) {
+	TWCR = (1<<TWEN) | (1<<TWINT);
+	while (!(TWCR & (1<<TWINT)));
+	return TWDR;
+}
+
+void i2c_stop(void) {
+	TWCR = (1<<TWEN) | (1<<TWSTO) | (1<<TWINT);
+}
+
+void aht20_init(void) {
+	if (i2c_start() != 0x08) return;
+	if (i2c_write((0x38 << 1) | 0) != 0x18) { i2c_stop(); return; }
+	if (i2c_write(0xBE) != 0x28) { i2c_stop(); return; }
+	if (i2c_write(0xAC) != 0x28) { i2c_stop(); return; }
+	if (i2c_write(0x00) != 0x28) { i2c_stop(); return; }
+	i2c_stop();
+	_delay_ms(80); // Poczekaj na inicjalizację
+}
+
+void rozpocznij_pomiar(void) {
+	if (i2c_start() != 0x08) return;
+	if (i2c_write((0x38 << 1) | 0) != 0x18) { i2c_stop(); return; }
+	if (i2c_write(0xAC) != 0x28) { i2c_stop(); return; }
+	if (i2c_write(0x33) != 0x28) { i2c_stop(); return; }
+	if (i2c_write(0x00) != 0x28) { i2c_stop(); return; }
+	i2c_stop();
+}
+
+void odczytaj_dane(void) {
+	if (i2c_start() != 0x08) return;
+	if (i2c_write((0x38 << 1) | 1) != 0x40) { i2c_stop(); return; }
+	for (int i = 0; i < 5; i++) {
+		dane_czujnika[i] = i2c_read_ack();
+		// TYMCZASOWE DO DEBUGOWANIA:
+		// PORTC = dane_czujnika[i];
+		// _delay_ms(500);
+	}
+	dane_czujnika[5] = i2c_read_nack();
+	i2c_stop();
+
+	if ((dane_czujnika[0] & 0x80) == 0) {
+		uint32_t rawTemp = ((uint32_t)(dane_czujnika[3] & 0x0F) << 16) | ((uint32_t)dane_czujnika[4] << 8) | dane_czujnika[5];
+		float temp_f = ((float)rawTemp / 1048576.0) * 200.0 - 50.0;
+		int8_t temp = (int8_t)(temp_f + 0.5);
+		temperatura_dziesiatki_global = temp / 10;
+		temperatura_jednosci_global = temp - temperatura_dziesiatki_global * 10;
+		odczyt_gotowy = 1;
+		} else {
+		// Opcjonalnie: ustaw jakieś wartości błędów, jeśli odczyt się nie powiódł
+		temperatura_dziesiatki_global = 14; // H
+		temperatura_jednosci_global = 10;   // A
+		odczyt_gotowy = 1; // Aby wyświetlić błąd
+	}
+}
+
+ISR(TIMER1_COMPA_vect) {
+	static uint8_t stan = 0;
+	static uint16_t licznik_opoznienia = 0;
+	const uint16_t czas_pomiaru_ms = 85; // Minimalny czas pomiaru + margines
+
+	switch (stan) {
+		case 0: // Rozpocznij pomiar
+		rozpocznij_pomiar();
+		licznik_opoznienia = 0;
+		stan = 1;
+		break;
+		case 1: // Odczekaj na zakończenie pomiaru
+		if (licznik_opoznienia >= czas_pomiaru_ms) {
+			odczytaj_dane();
+			stan = 0;
+		}
+		licznik_opoznienia++;
+		break;
+	}
+}
+
+int main(void)
+{
+	DDRD = 255;
+	DDRB = 255;
+
+	// Inicjalizacja I2C
+	TWSR = 0;
+	TWBR = 23;
+
+	// Inicjalizacja czujnika AHT20
+	aht20_init();
+
+	// Inicjalizacja Timera 1 do generowania przerwań co np. 10ms (do odmierzania czasu pomiaru)
+	TCCR1A = 0;
+	TCCR1B = (1 << WGM12) | (1 << CS11); // CTC mode, prescaler 8 dla 1MHz -> 125 kHz
+	OCR1A = 1249; // Przerwanie co 10ms (125000 / (1249 + 1))
+	TIMSK |= (1 << OCIE1A);
+	sei();
+
+	uint8_t cyfry[] = {8, 8, 8, 8};
+	uint8_t segmenty[] = {0b00001110, 0b00001101, 0b00001011, 0b00000111};
+	uint8_t indeks_cyfry = 0;
+	
+    while (1) 
+    {
+	if (odczyt_gotowy) {
+		cyfry[0] = temperatura_dziesiatki_global;
+		cyfry[1] = temperatura_jednosci_global;
+		cyfry[2] = 15; // Stopień
+		cyfry[3] = 12; // C
+		odczyt_gotowy = 0;
+	}
+
+	PORTB = segmenty[indeks_cyfry];
+	wyswietlCyfre(cyfry[indeks_cyfry]);
+	_delay_ms(2);
+	PORTB = 0x00;
+
+	indeks_cyfry = (indeks_cyfry + 1) % 4;
+    }
+}
+
